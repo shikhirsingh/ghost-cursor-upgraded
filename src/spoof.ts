@@ -3,18 +3,18 @@ import debug from 'debug'
 import {
   type Vector,
   type TimedVector,
-  bezierCurve,
-  bezierCurveSpeed,
   direction,
   magnitude,
   origin,
   overshoot,
   add,
   clamp,
-  scale,
-  extrapolate
+  scale
 } from './math'
 import { installMouseHelper } from './mouse-helper'
+import { MovementEngine } from './movement/movement-engine'
+import { BezierMovementAlgorithm } from './movement/bezier-movement'
+import type { MovementAlgorithm, MovementOptions } from './movement/types'
 
 // TODO: remove in next major version, is now wrapped in the GhostCursor class.
 export { installMouseHelper }
@@ -128,21 +128,21 @@ export interface ClickOptions extends MoveOptions {
   readonly clickCount?: number
 }
 
-export interface PathOptions {
+export interface PathOptions extends MovementOptions {
   /**
    * Override the spread of the generated path.
    */
-  readonly spreadOverride?: number
+  readonly spreadOverride?: MovementOptions['spreadOverride']
   /**
    * Speed of mouse movement.
    * Default is random.
    */
-  readonly moveSpeed?: number
+  readonly moveSpeed?: MovementOptions['moveSpeed']
 
   /**
    * Generate timestamps for each point in the path.
    */
-  readonly useTimestamps?: boolean
+  readonly useTimestamps?: MovementOptions['useTimestamps']
 }
 
 export interface RandomMoveOptions extends Pick<MoveOptions, 'moveDelay' | 'randomizeMoveDelay' | 'moveSpeed'> {
@@ -203,18 +203,6 @@ export interface DefaultOptions {
 const delay = async (ms: number): Promise<void> => {
   if (ms < 1) return
   return await new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-/**
- * Calculate the amount of time needed to move from (x1, y1) to (x2, y2)
- * given the width of the element being clicked on
- * https://en.wikipedia.org/wiki/Fitts%27s_law
- */
-const fitts = (distance: number, width: number): number => {
-  const a = 0
-  const b = 2
-  const id = Math.log2(distance / width + 1)
-  return a + b * id
 }
 
 /** Get a random point on a box */
@@ -310,6 +298,8 @@ export const getElementBox = async (
   }
 }
 
+const defaultMovementEngine = new MovementEngine(new BezierMovementAlgorithm())
+
 /** Generates a set of points for mouse movement between two coordinates. */
 export function path (
   start: Vector,
@@ -320,69 +310,11 @@ export function path (
    */
   // TODO: remove number arg in next major version change, fine to just allow `spreadOverride` in object.
   options?: number | PathOptions): Vector[] | TimedVector[] {
-  const optionsResolved: PathOptions = typeof options === 'number'
+  const movementOptions: MovementOptions = typeof options === 'number'
     ? { spreadOverride: options }
     : { ...options }
 
-  const DEFAULT_WIDTH = 100
-  const MIN_STEPS = 25
-  const width = 'width' in end && end.width !== 0 ? end.width : DEFAULT_WIDTH
-  const curve = bezierCurve(start, end, optionsResolved.spreadOverride)
-  const length = curve.length() * 0.8
-
-  const speed = optionsResolved.moveSpeed !== undefined && optionsResolved.moveSpeed > 0
-    ? (25 / optionsResolved.moveSpeed)
-    : Math.random()
-  const baseTime = speed * MIN_STEPS
-  const steps = Math.ceil((Math.log2(fitts(length, width) + 1) + baseTime) * 3)
-  const re = curve.getLUT(steps)
-  return clampPositive(re, optionsResolved)
-}
-
-const clampPositive = (vectors: Vector[], options?: PathOptions): Vector[] | TimedVector[] => {
-  const clampedVectors = vectors.map((vector) => ({
-    x: Math.max(0, vector.x),
-    y: Math.max(0, vector.y)
-  }))
-
-  return options?.useTimestamps === true ? generateTimestamps(clampedVectors, options) : clampedVectors
-}
-
-const generateTimestamps = (vectors: Vector[], options?: PathOptions): TimedVector[] => {
-  const speed = options?.moveSpeed ?? (Math.random() * 0.5 + 0.5)
-  const timeToMove = (P0: Vector, P1: Vector, P2: Vector, P3: Vector, samples: number): number => {
-    let total = 0
-    const dt = 1 / samples
-
-    for (let t = 0; t < 1; t += dt) {
-      const v1 = bezierCurveSpeed(t * dt, P0, P1, P2, P3)
-      const v2 = bezierCurveSpeed(t, P0, P1, P2, P3)
-      total += (v1 + v2) * dt / 2
-    }
-
-    return Math.round(total / speed)
-  }
-
-  const timedVectors: TimedVector[] = []
-
-  for (let i = 0; i < vectors.length; i++) {
-    if (i === 0) {
-      timedVectors.push({ ...vectors[i], timestamp: Date.now() })
-    } else {
-      const P0 = vectors[i - 1]
-      const P1 = vectors[i]
-      const P2 = i + 1 < vectors.length ? vectors[i + 1] : extrapolate(P0, P1)
-      const P3 = i + 2 < vectors.length ? vectors[i + 2] : extrapolate(P1, P2)
-      const time = timeToMove(P0, P1, P2, P3, vectors.length)
-
-      timedVectors.push({
-        ...vectors[i],
-        timestamp: timedVectors[i - 1].timestamp + time
-      })
-    }
-  }
-
-  return timedVectors
+  return defaultMovementEngine.generate(start, end, movementOptions).vectors
 }
 
 const shouldOvershoot = (a: Vector, b: Vector, threshold: number): boolean =>
@@ -408,6 +340,8 @@ export class GhostCursor {
   private moving: boolean = false
   /** Make the cursor no longer visible. Defined only if `visible=true` was passed, or `installMouseHelper` ran later. */
   private removeMouseHelperFn: undefined | (() => Promise<void>)
+  /** Movement engine backing cursor motion. */
+  private readonly movementEngine: MovementEngine
 
   private static readonly OVERSHOOT_SPREAD = 10
   private static readonly OVERSHOOT_RADIUS = 120
@@ -418,7 +352,8 @@ export class GhostCursor {
       start = origin,
       performRandomMoves = false,
       defaultOptions = {},
-      visible = false
+      visible = false,
+      movementAlgorithm
     }:
     {
       /**
@@ -435,18 +370,24 @@ export class GhostCursor {
       /**
          * Set custom default options for cursor action functions.
          * Default values are described in the type JSdocs.
-         */
+       */
       defaultOptions?: DefaultOptions
       /**
          * Whether cursor should be made visible using `installMouseHelper`.
          * @default false
-         */
+       */
       visible?: boolean
+      /**
+         * Algorithm responsible for producing movement vectors.
+         * @default Bezier-based default implementation
+         */
+      movementAlgorithm?: MovementAlgorithm
     } = {}
   ) {
     this.page = page
     this.location = start
     this.defaultOptions = defaultOptions
+    this.movementEngine = new MovementEngine(movementAlgorithm ?? new BezierMovementAlgorithm())
 
     if (visible) {
       // Install mouse helper (visible mouse). Do not await the promise but return immediately
@@ -484,14 +425,14 @@ export class GhostCursor {
     this.removeMouseHelperFn = undefined
   }
 
-  /** Move the mouse to a point, getting the vectors via `path(previous, newLocation, options)`  */
+  /** Move the mouse to a point, getting the vectors from the configured movement engine. */
   private async moveMouse (
     newLocation: BoundingBox | Vector,
     options?: PathOptions,
     abortOnMove: boolean = false
   ): Promise<void> {
     const cdpClient = getCDPClient(this.page)
-    const vectors = path(this.location, newLocation, options)
+    const { vectors } = this.movementEngine.generate(this.location, newLocation, options)
 
     for (const v of vectors) {
       try {
@@ -1026,3 +967,7 @@ export const createCursor = (
    */
   visible: boolean = false
 ): GhostCursor => new GhostCursor(page, { start, performRandomMoves, defaultOptions, visible })
+
+export { MovementEngine } from './movement/movement-engine'
+export { BezierMovementAlgorithm } from './movement/bezier-movement'
+export type { MovementAlgorithm, MovementMetrics, MovementTrace, MovementOptions } from './movement/types'
